@@ -284,3 +284,166 @@ def scan_tfbs(
 
     logger.info("TFBS matrix: %d non-zero entries (%.2f%%)", mat.sum(), mat.sum() / mat.size * 100)
     return tfs, genes, mat
+
+
+# ---------------------------------------------------------------------------
+# Continuous PWM scoring — richer features per TF-gene pair
+# ---------------------------------------------------------------------------
+
+def _score_all_hits(
+    seq_str: str,
+    log_odds: np.ndarray,
+    min_score: float = 0.0,
+) -> list[tuple[float, int, bool]]:
+    """Return all motif hits above min_score as (score, position, is_forward)."""
+    nuc_map = {"A": 0, "C": 1, "G": 2, "T": 3}
+    L = log_odds.shape[1]
+    hits = []
+
+    if len(seq_str) < L:
+        return hits
+
+    rc_log_odds = log_odds[::-1, ::-1]
+
+    for strand, lo in [(True, log_odds), (False, rc_log_odds)]:
+        for i in range(len(seq_str) - L + 1):
+            score = 0.0
+            valid = True
+            for j, nuc in enumerate(seq_str[i : i + L]):
+                if nuc in nuc_map:
+                    score += lo[nuc_map[nuc], j]
+                else:
+                    valid = False
+                    break
+            if valid and score >= min_score:
+                hits.append((score, i, strand))
+
+    return hits
+
+
+def scan_tfbs_continuous(
+    tf_motif_file: str | Path,
+    pwm_file: str | Path,
+    promoter_file: str | Path,
+    gene_seq_file: str | Path,
+    th_pre_tss: int = 1000,
+    th_post_tss: int = 200,
+    bg: dict[str, float] | None = None,
+    n_features: int = 4,
+) -> tuple[list[str], list[str], np.ndarray]:
+    """Compute continuous TFBS features per TF-gene pair.
+
+    Instead of a binary match, returns a multi-dimensional feature matrix
+    capturing the strength and distribution of motif matches.
+
+    Features per TF-gene pair (n_features=4):
+        0: best_score — max log-odds score across all motif hits (both strands)
+        1: n_hits — number of hits above the 50th percentile threshold
+        2: best_position — position of best hit relative to TSS (0=at TSS, 1=distal)
+        3: score_percentile — rank of this gene's best score among all genes for this TF
+
+    Parameters
+    ----------
+    tf_motif_file, pwm_file, promoter_file, gene_seq_file : path
+        Same as scan_tfbs().
+    th_pre_tss, th_post_tss : int
+        Sequence lengths.
+    bg : dict, optional
+        Background nucleotide frequencies.
+    n_features : int
+        Number of features per TF-gene pair.
+
+    Returns
+    -------
+    tf_names : list[str]
+    gene_names : list[str]
+    features : np.ndarray of shape (n_tfs, n_genes, n_features)
+    """
+    if bg is None:
+        bg = {"A": 0.3253439, "C": 0.1746561, "G": 0.1746561, "T": 0.3253439}
+
+    tf_motifs = load_tf_motif_mapping(tf_motif_file)
+    pwms = load_pwms(pwm_file)
+    promoter_seqs = load_sequences(promoter_file, max_length=th_pre_tss)
+    gene_seqs = load_sequences(gene_seq_file, max_length=th_post_tss)
+
+    tfs = sorted(tf_motifs.keys())
+    genes = sorted(set(promoter_seqs.keys()) | set(gene_seqs.keys()))
+    n_tfs = len(tfs)
+    n_genes = len(genes)
+
+    logger.info("Continuous TFBS scoring: %d TFs, %d genes", n_tfs, n_genes)
+
+    # Pre-compute log-odds for each motif
+    motif_log_odds = {}
+    for motif_id, pwm in pwms.items():
+        motif_log_odds[motif_id] = _pwm_to_log_odds(pwm, bg)
+
+    # Compute raw best scores per TF-gene
+    best_scores = np.full((n_tfs, n_genes), -np.inf)
+    hit_counts = np.zeros((n_tfs, n_genes), dtype=np.int32)
+    best_positions = np.zeros((n_tfs, n_genes))
+    seq_length = th_pre_tss + th_post_tss
+
+    for i, tf in enumerate(tfs):
+        if (i + 1) % 100 == 0:
+            logger.info("  TFBS features: TF %d/%d", i + 1, n_tfs)
+
+        motif_ids = tf_motifs.get(tf, [])
+        if not motif_ids:
+            continue
+
+        for j, gene in enumerate(genes):
+            all_hits = []
+
+            # Scan promoter
+            if gene in promoter_seqs:
+                for mid in motif_ids:
+                    if mid not in motif_log_odds:
+                        continue
+                    hits = _score_all_hits(promoter_seqs[gene], motif_log_odds[mid])
+                    all_hits.extend(hits)
+
+            # Scan gene body
+            if gene in gene_seqs:
+                for mid in motif_ids:
+                    if mid not in motif_log_odds:
+                        continue
+                    hits = _score_all_hits(gene_seqs[gene], motif_log_odds[mid])
+                    # Offset positions by promoter length
+                    all_hits.extend((s, p + th_pre_tss, fw) for s, p, fw in hits)
+
+            if all_hits:
+                scores = [h[0] for h in all_hits]
+                best_idx = int(np.argmax(scores))
+                best_scores[i, j] = scores[best_idx]
+                hit_counts[i, j] = len(all_hits)
+                best_positions[i, j] = all_hits[best_idx][1] / seq_length
+
+    # Compute per-TF percentile ranks
+    score_percentiles = np.zeros((n_tfs, n_genes))
+    for i in range(n_tfs):
+        valid = best_scores[i] > -np.inf
+        if valid.sum() > 0:
+            from scipy.stats import rankdata
+            ranks = np.zeros(n_genes)
+            ranks[valid] = rankdata(best_scores[i, valid]) / valid.sum()
+            score_percentiles[i] = ranks
+
+    # Replace -inf with 0 for best_scores
+    best_scores[best_scores == -np.inf] = 0.0
+
+    # Stack features
+    features = np.stack([
+        best_scores,
+        np.log1p(hit_counts.astype(np.float64)),  # log-transform counts
+        best_positions,
+        score_percentiles,
+    ], axis=-1)  # (n_tfs, n_genes, 4)
+
+    logger.info(
+        "Continuous TFBS features: shape %s, genes with hits: %d/%d",
+        features.shape,
+        (best_scores > 0).any(axis=0).sum(), n_genes,
+    )
+    return tfs, genes, features
