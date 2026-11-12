@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "merit"
+version = "1.0.0"
+description = "MastEr Regulator Inference Tool - Python port of Release 1.0"
+authors = [{name = "Michael Banf"}]
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.11",
+    "scikit-learn>=1.3",
+    "biopython>=1.81",
+    "pyyaml>=6.0",
+    "tqdm>=4.65",
+    "openpyxl>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+include = ["merit*"]
+
+[tool.ruff]
+line-length = 100
