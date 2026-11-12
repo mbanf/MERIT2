@@ -94,15 +94,20 @@ def compute_network_stats(
 
     # Compute validation metrics if gold-standard provided
     if val_edges and tf_names and gene_names:
-        predicted = set()
-        for i in range(binary.shape[0]):
-            for j in range(binary.shape[1]):
-                if binary[i, j]:
-                    predicted.add((tf_names[i], gene_names[j]))
+        tf_idx_map = {t: i for i, t in enumerate(tf_names)}
+        gene_idx_map = {g: i for i, g in enumerate(gene_names)}
+        val_matrix = np.zeros_like(binary, dtype=bool)
+        for tf, tgt in val_edges:
+            ti = tf_idx_map.get(tf)
+            gi = gene_idx_map.get(tgt)
+            if ti is not None and gi is not None:
+                val_matrix[ti, gi] = True
 
-        tp = len(predicted & val_edges)
-        fp = len(predicted - val_edges)
-        fn = len(val_edges - predicted)
+        tp = int((binary & val_matrix).sum())
+        n_pred = int(binary.sum())
+        n_val = int(val_matrix.sum())
+        fp = n_pred - tp
+        fn = n_val - tp
         stats.val_precision = tp / max(tp + fp, 1)
         stats.val_recall = tp / max(tp + fn, 1)
         stats.val_f1 = 2 * stats.val_precision * stats.val_recall / max(
@@ -205,8 +210,20 @@ def refine_network_rl(
     best_probs = edge_probs.copy()
     reward_history = []
 
-    logger.info("RL refinement: %d episodes, %d train edges, %d val edges",
-                episodes, len(train_edges), len(val_edges))
+    # Precompute train matrix for vectorized reward (avoid nested loops)
+    n_tfs, n_genes = edge_probs.shape
+    tf_idx = {t: i for i, t in enumerate(tf_names)}
+    gene_idx = {g: i for i, g in enumerate(gene_names)}
+    train_matrix = np.zeros((n_tfs, n_genes), dtype=bool)
+    for tf, tgt in train_edges:
+        ti = tf_idx.get(tf)
+        gi = gene_idx.get(tgt)
+        if ti is not None and gi is not None:
+            train_matrix[ti, gi] = True
+    n_train_mapped = int(train_matrix.sum())
+
+    logger.info("RL refinement: %d episodes, %d train edges (%d mapped), %d val edges",
+                episodes, len(train_edges), n_train_mapped, len(val_edges))
 
     for episode in range(episodes):
         # Compute current state
@@ -267,23 +284,18 @@ def refine_network_rl(
         if require_motif and motif_features is not None:
             rescored = rescored * (motif_features > 0).astype(float)
 
-        # Compute reward on training set
+        # Compute reward on training set (vectorized)
         binary = rescored >= threshold
-        predicted = set()
-        for i in range(binary.shape[0]):
-            for j in range(binary.shape[1]):
-                if binary[i, j]:
-                    predicted.add((tf_names[i], gene_names[j]))
-
-        tp = len(predicted & train_edges)
-        fp = len(predicted - train_edges)
-        fn = len(train_edges - predicted)
+        tp = int((binary & train_matrix).sum())
+        n_predicted = int(binary.sum())
+        fp = n_predicted - tp
+        fn = n_train_mapped - tp
         precision = tp / max(tp + fp, 1)
         recall = tp / max(tp + fn, 1)
         f1 = 2 * precision * recall / max(precision + recall, 1e-8)
 
         # Density penalty
-        density = len(predicted) / max(binary.size, 1)
+        density = n_predicted / max(binary.size, 1)
         density_penalty = max(0, density - 0.01) * 5
 
         reward = f1 - density_penalty
@@ -315,7 +327,7 @@ def refine_network_rl(
                 "  Episode %d/%d: reward=%.4f (avg=%.4f), best=%.4f, "
                 "threshold=%.3f, edges=%d",
                 episode + 1, episodes, reward, avg_reward, best_reward,
-                threshold, len(predicted),
+                threshold, n_predicted,
             )
 
     # Evaluate best action on validation set

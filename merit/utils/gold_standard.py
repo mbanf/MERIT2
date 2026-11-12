@@ -80,8 +80,10 @@ class GoldStandard:
         return "\n".join(lines)
 
 
-def _normalize_gene_id(gene_id: str) -> str:
+def _normalize_gene_id(gene_id) -> str:
     """Normalize Arabidopsis gene IDs to uppercase AT format."""
+    if not isinstance(gene_id, str):
+        return ""
     gid = gene_id.strip().upper()
     # Handle At1g01010 -> AT1G01010 format
     if len(gid) == 9 and gid[:2] == "AT" and gid[3] == "G":
@@ -117,15 +119,33 @@ def load_atrm(filepath: str | Path) -> pd.DataFrame:
 def load_atregnet(filepath: str | Path) -> pd.DataFrame:
     """Load AtRegNet / AGRIS interactions.
 
-    CSV with columns: TFName, TFLocus, TFFamily, TargetName, TargetLocus, ...
+    The CSV has the TF common name as the first (index) column, causing all
+    other columns to shift by one position. The actual mapping is:
+        index = TF common name (FLC, HY5, ...)
+        "TFName" column = TF locus ID (At5g10140)
+        "TFLocus" column = TF family (MADS, bZIP)
+        "TFFamily" column = Target common name
+        "TargetName" column = Target locus ID (At1g65480)
+        "TargetType" column = Confirmation status
+
+    Only "Confirmed" interactions are used (matching v1.0 benchmarks.R line 66).
     """
     df = pd.read_csv(filepath, dtype=str)
+
+    # Filter to confirmed interactions (shifted column: "TargetType" = Confirmation)
+    if "TargetType" in df.columns:
+        confirmed_mask = df["TargetType"].fillna("").str.strip().str.lower() == "confirmed"
+        logger.info("AtRegNet: %d/%d rows are Confirmed", confirmed_mask.sum(), len(df))
+        df = df[confirmed_mask]
+
+    # Shifted columns: "TFName" = TF locus, "TargetName" = Target locus
     edges = pd.DataFrame({
-        "tf": df["TFLocus"].apply(_normalize_gene_id),
-        "target": df["TargetLocus"].apply(_normalize_gene_id),
+        "tf": df["TFName"].apply(_normalize_gene_id),
+        "target": df["TargetName"].apply(_normalize_gene_id),
     })
+    edges = edges[(edges["tf"] != "") & (edges["target"] != "")]
     edges = edges[edges["tf"] != edges["target"]].drop_duplicates()
-    logger.info("AtRegNet: %d unique edges, %d TFs", len(edges), edges["tf"].nunique())
+    logger.info("AtRegNet: %d confirmed unique edges, %d TFs", len(edges), edges["tf"].nunique())
     return edges
 
 
@@ -236,3 +256,63 @@ def train_test_split_edges(
 
     logger.info("Train/test split: %d / %d edges", len(train_edges), len(test_edges))
     return train_edges, test_edges
+
+
+def split_by_source(
+    gold_standard: GoldStandard,
+    train_sources: list[str],
+    eval_sources: list[str],
+) -> tuple[set[tuple[str, str]], dict[str, set[tuple[str, str]]]]:
+    """Split gold-standard by data source for train vs evaluation.
+
+    Parameters
+    ----------
+    gold_standard : GoldStandard
+    train_sources : list[str]
+        Sources to use for training (e.g. ["dapseq"]).
+    eval_sources : list[str]
+        Sources to use for evaluation (e.g. ["atrm", "atregnet"]).
+
+    Returns
+    -------
+    train_edges : set of (tf, target) tuples
+        Edges from train_sources (excluding any also in eval_sources).
+    eval_edge_sets : dict mapping source name -> set of (tf, target) tuples
+        Per-source evaluation sets for separate AUROC reporting.
+    """
+    df = gold_standard.edges
+
+    # Collect eval edges per source
+    eval_edge_sets = {}
+    all_eval_edges = set()
+    for source in eval_sources:
+        col = f"src_{source}"
+        if col in df.columns:
+            mask = df[col] == True
+            edges = set(zip(df.loc[mask, "tf"], df.loc[mask, "target"]))
+            eval_edge_sets[source] = edges
+            all_eval_edges |= edges
+            logger.info("Eval source '%s': %d edges", source, len(edges))
+
+    # Collect train edges (from train sources, excluding eval edges)
+    train_edges = set()
+    for source in train_sources:
+        col = f"src_{source}"
+        if col in df.columns:
+            mask = df[col] == True
+            edges = set(zip(df.loc[mask, "tf"], df.loc[mask, "target"]))
+            train_edges |= edges
+
+    # Remove eval edges from training to prevent leakage
+    n_overlap = len(train_edges & all_eval_edges)
+    train_edges -= all_eval_edges
+
+    logger.info(
+        "Source-based split: %d train edges (%s), %d eval edges (%s), "
+        "%d overlap removed from train",
+        len(train_edges), "+".join(train_sources),
+        len(all_eval_edges), "+".join(eval_sources),
+        n_overlap,
+    )
+
+    return train_edges, eval_edge_sets

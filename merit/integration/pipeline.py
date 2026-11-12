@@ -2,12 +2,18 @@
 
 Orchestrates the full MERIT v2.0 workflow:
     1. Load v1.0 intermediate score matrices (.rds)
-    2. Load and merge gold-standard edges
+    2. Load gold-standard edges — DAP-seq for training, ATRM+AtRegNet for eval
     3. Build per-edge feature vectors
-    4. Train MLP edge predictor (MLX or PyTorch)
-    5. RL-based network refinement
-    6. Evaluate on held-out gold-standard
+    4. Train MLP or GAT edge predictor (MLX or PyTorch)
+    5. RL-based network refinement (train on DAP-seq subset)
+    6. Evaluate on ATRM + AtRegNet (same benchmarks as v1.0 for comparability)
     7. Export refined network
+
+Evaluation strategy:
+    - DAP-seq (~1.8M in vitro binding edges) → training signal
+    - ATRM (~1,165 literature-curated edges) → evaluation (highest quality)
+    - AtRegNet (~228 confirmed edges) → evaluation (high quality)
+    - AUROC reported per eval source for direct v1.0 comparison
 
 Can run on actual Release 1.0 data (requires pyreadr) or in
 synthetic mode for pipeline testing.
@@ -26,6 +32,7 @@ import pandas as pd
 from merit.utils.gold_standard import (
     GoldStandard,
     load_all_gold_standards,
+    split_by_source,
     train_test_split_edges,
 )
 from merit.utils.rds_loader import (
@@ -105,7 +112,8 @@ def _synthetic_gold_standard(
             edges.add((tf, gene))
 
     records = [
-        {"tf": tf, "target": tgt, "sources": "synthetic", "n_sources": 1}
+        {"tf": tf, "target": tgt, "sources": "synthetic",
+         "n_sources": 1, "src_synthetic": True}
         for tf, tgt in sorted(edges)
     ]
     df = pd.DataFrame(records)
@@ -114,6 +122,112 @@ def _synthetic_gold_standard(
         tf_names=sorted(set(r["tf"] for r in records)),
         target_names=sorted(set(r["target"] for r in records)),
     )
+
+
+def compute_auroc(
+    probs: np.ndarray,
+    eval_edges: set[tuple[str, str]],
+    tf_names: list[str],
+    gene_names: list[str],
+) -> float:
+    """Compute AUROC for edge predictions vs gold-standard.
+
+    Evaluates only TF-gene pairs where the TF appears in the eval set,
+    matching v1.0's evaluation approach (restricted to TFs with known targets).
+    """
+    # Identify TFs that appear in eval edges
+    eval_tfs = {tf for tf, _ in eval_edges}
+    tf_idx = {t: i for i, t in enumerate(tf_names)}
+    gene_idx = {g: i for i, g in enumerate(gene_names)}
+
+    # Collect predictions and labels for relevant TF-gene pairs
+    y_true = []
+    y_score = []
+    for tf in eval_tfs:
+        ti = tf_idx.get(tf)
+        if ti is None:
+            continue
+        for j, gene in enumerate(gene_names):
+            y_score.append(probs[ti, j])
+            y_true.append(1.0 if (tf, gene) in eval_edges else 0.0)
+
+    y_true = np.array(y_true)
+    y_score = np.array(y_score)
+
+    if y_true.sum() == 0 or y_true.sum() == len(y_true):
+        logger.warning("AUROC undefined: all labels identical")
+        return 0.0
+
+    # Compute AUROC (manual — no sklearn dependency)
+    # Sort by descending score
+    order = np.argsort(-y_score)
+    y_sorted = y_true[order]
+
+    n_pos = y_sorted.sum()
+    n_neg = len(y_sorted) - n_pos
+
+    # Trapezoidal integration
+    tp = 0.0
+    fp = 0.0
+    auroc = 0.0
+    prev_tpr = 0.0
+    prev_fpr = 0.0
+
+    for label in y_sorted:
+        if label > 0.5:
+            tp += 1
+        else:
+            fp += 1
+        tpr = tp / n_pos
+        fpr = fp / n_neg
+        # Trapezoidal rule
+        auroc += 0.5 * (tpr + prev_tpr) * (fpr - prev_fpr)
+        prev_tpr = tpr
+        prev_fpr = fpr
+
+    return float(auroc)
+
+
+def _evaluate(
+    label: str,
+    probs: np.ndarray,
+    threshold: float,
+    eval_edge_sets: dict[str, set[tuple[str, str]]],
+    tf_names: list[str],
+    gene_names: list[str],
+) -> dict:
+    """Evaluate edge predictions against multiple gold-standard sources.
+
+    Reports precision/recall/F1 at threshold + AUROC per source.
+    """
+    binary = probs >= threshold
+    # Build predicted set efficiently using numpy
+    pred_i, pred_j = np.where(binary)
+    predicted = {(tf_names[i], gene_names[j]) for i, j in zip(pred_i, pred_j)}
+
+    results = {}
+    for source, eval_edges in eval_edge_sets.items():
+        tp = len(predicted & eval_edges)
+        fp_count = len(predicted) - tp  # approx: FP relative to this source
+        fn = len(eval_edges - predicted)
+        precision = tp / max(tp + fp_count, 1)
+        recall = tp / max(tp + fn, 1)
+        f1 = 2 * precision * recall / max(precision + recall, 1e-8)
+
+        auroc = compute_auroc(probs, eval_edges, tf_names, gene_names)
+
+        logger.info(
+            "%s [%s] (threshold=%.3f): AUROC=%.4f P=%.4f R=%.4f F1=%.4f "
+            "(TP=%d FN=%d, %d predicted, %d gold)",
+            label, source, threshold, auroc, precision, recall, f1,
+            tp, fn, len(predicted), len(eval_edges),
+        )
+        results[source] = {
+            "auroc": auroc, "precision": precision, "recall": recall,
+            "f1": f1, "tp": tp, "fn": fn,
+        }
+
+    return results
 
 
 def run_pipeline(
@@ -125,8 +239,6 @@ def run_pipeline(
     synthetic: bool = False,
     epochs_predictor: int = 100,
     epochs_rl: int = 300,
-    test_fraction: float = 0.2,
-    min_sources: int = 1,
     seed: int = 42,
 ) -> EdgePrediction:
     """Run the full v2.0 integration pipeline.
@@ -146,13 +258,9 @@ def run_pipeline(
     synthetic : bool
         Use synthetic data for testing (no file dependencies).
     epochs_predictor : int
-        Training epochs for the edge predictor MLP.
+        Training epochs for the edge predictor.
     epochs_rl : int
         Episodes for RL refinement.
-    test_fraction : float
-        Fraction of gold-standard edges held out for evaluation.
-    min_sources : int
-        Minimum number of gold-standard sources required per edge.
     seed : int
 
     Returns
@@ -170,13 +278,16 @@ def run_pipeline(
         logger.info("Using synthetic data for pipeline testing")
         intermediates, tf_names, gene_names = _synthetic_intermediates(seed=seed)
         gold = _synthetic_gold_standard(tf_names, gene_names, seed=seed)
+        # Synthetic: random split since there's only one source
+        train_list, test_list = train_test_split_edges(gold, test_fraction=0.2, seed=seed)
+        train_edges = set(train_list)
+        eval_edge_sets = {"synthetic": set(test_list)}
     else:
         if rds_dir is None or gold_dir is None:
             raise ValueError("rds_dir and gold_dir required when not in synthetic mode")
         intermediates = load_v1_intermediates(rds_dir)
         gold = load_all_gold_standards(gold_dir)
 
-        # Get TF/gene names from RDS data or gold-standard
         tf_names = intermediates.tf_names
         gene_names = intermediates.gene_names
         if tf_names is None or gene_names is None:
@@ -185,6 +296,13 @@ def run_pipeline(
                 "Set them after loading RDS matrices."
             )
 
+        # Source-based split: train on DAP-seq, evaluate on ATRM + AtRegNet
+        train_edges, eval_edge_sets = split_by_source(
+            gold,
+            train_sources=["dapseq"],
+            eval_sources=["atrm", "atregnet"],
+        )
+
     logger.info("Data: %d TFs x %d genes", len(tf_names), len(gene_names))
 
     # ── Step 2: Build edge features ────────────────────────────────────
@@ -192,28 +310,44 @@ def run_pipeline(
     n_tfs, n_genes, n_features = edge_features.shape
     logger.info("Edge features: %s (%d features per edge)", edge_features.shape, n_features)
 
-    # ── Step 3: Prepare gold-standard train/test ───────────────────────
-    train_edges_list, test_edges_list = train_test_split_edges(
-        gold, test_fraction=test_fraction, min_sources=min_sources, seed=seed,
-    )
-    train_edges = set(train_edges_list)
-    test_edges = set(test_edges_list)
+    # ── Step 3: Build training matrix from DAP-seq edges ───────────────
+    tf_idx_map = {t: i for i, t in enumerate(tf_names)}
+    gene_idx_map = {g: i for i, g in enumerate(gene_names)}
 
-    # Build gold-standard matrix for training
-    gs_matrix = gold.to_matrix(tf_names, gene_names, min_sources=min_sources)
-    # Zero out test edges in training matrix
-    tf_idx = {t: i for i, t in enumerate(tf_names)}
-    gene_idx = {g: i for i, g in enumerate(gene_names)}
-    train_matrix = gs_matrix.copy()
-    for tf, tgt in test_edges:
-        ti = tf_idx.get(tf)
-        gi = gene_idx.get(tgt)
+    train_matrix = np.zeros((n_tfs, n_genes), dtype=np.float64)
+    n_mapped = 0
+    for tf, tgt in train_edges:
+        ti = tf_idx_map.get(tf)
+        gi = gene_idx_map.get(tgt)
         if ti is not None and gi is not None:
-            train_matrix[ti, gi] = 0.0
+            train_matrix[ti, gi] = 1.0
+            n_mapped += 1
 
-    n_train_pos = int(train_matrix.sum())
-    n_test = len(test_edges)
-    logger.info("Gold-standard: %d train positives, %d test edges", n_train_pos, n_test)
+    # Count eval edges that map to our TF x gene space
+    all_eval_edges = set()
+    for edges in eval_edge_sets.values():
+        all_eval_edges |= edges
+    n_eval_mapped = sum(
+        1 for tf, tgt in all_eval_edges
+        if tf in tf_idx_map and tgt in gene_idx_map
+    )
+
+    logger.info(
+        "Training: %d DAP-seq edges mapped to matrix (%d total train)",
+        n_mapped, len(train_edges),
+    )
+    logger.info(
+        "Evaluation: %d ATRM+AtRegNet edges mapped (%d total eval)",
+        n_eval_mapped, len(all_eval_edges),
+    )
+
+    # Split DAP-seq training into train/val for RL
+    train_list = list(train_edges)
+    rng = np.random.RandomState(seed)
+    rng.shuffle(train_list)
+    split = int(len(train_list) * 0.9)
+    rl_train = set(train_list[:split])
+    rl_val = set(train_list[split:])
 
     # ── Step 4: Train edge predictor ───────────────────────────────────
     logger.info("Training edge predictor (model=%s, backend=%s, %d epochs)...",
@@ -244,7 +378,6 @@ def run_pipeline(
             logits = predictor(X).squeeze(-1)
             edge_probs = torch.sigmoid(logits).numpy().reshape(n_tfs, n_genes)
     else:
-        # NumPy fallback: simple weighted average of features
         logger.warning("No ML backend — using weighted feature average as baseline")
         edge_probs = edge_features.mean(axis=-1)
         mn, mx_val = edge_probs.min(), edge_probs.max()
@@ -254,8 +387,8 @@ def run_pipeline(
     logger.info("Edge predictor done. Prob range: [%.4f, %.4f], mean: %.4f",
                 edge_probs.min(), edge_probs.max(), edge_probs.mean())
 
-    # Evaluate predictor on test set before RL
-    _evaluate("Pre-RL", edge_probs, 0.5, test_edges, tf_names, gene_names)
+    # Evaluate predictor before RL (on ATRM + AtRegNet)
+    _evaluate("Pre-RL", edge_probs, 0.5, eval_edge_sets, tf_names, gene_names)
 
     # ── Step 5: RL refinement ──────────────────────────────────────────
     logger.info("Running RL refinement (%d episodes)...", epochs_rl)
@@ -265,8 +398,8 @@ def run_pipeline(
         edge_probs=edge_probs,
         tf_names=tf_names,
         gene_names=gene_names,
-        train_edges=train_edges,
-        val_edges=test_edges,
+        train_edges=rl_train,
+        val_edges=rl_val,
         motif_features=intermediates.motif_matrix,
         episodes=epochs_rl,
     )
@@ -276,9 +409,9 @@ def run_pipeline(
                 best_action.threshold, best_action.rf_weight, best_action.lr_weight,
                 best_action.clr_weight, best_action.motif_weight, best_action.require_motif)
 
-    # Evaluate after RL
-    _evaluate("Post-RL", refined_probs, best_action.threshold,
-              test_edges, tf_names, gene_names)
+    # Evaluate after RL (on ATRM + AtRegNet — never seen during training)
+    eval_results = _evaluate("Post-RL", refined_probs, best_action.threshold,
+                             eval_edge_sets, tf_names, gene_names)
 
     # ── Step 6: Build result ───────────────────────────────────────────
     result = EdgePrediction(
@@ -287,11 +420,10 @@ def run_pipeline(
         gene_names=gene_names,
     )
 
-    # Save if output directory provided
     if output_dir is not None:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        _save_results(result, best_action, output_dir)
+        _save_results(result, best_action, eval_results, output_dir)
 
     elapsed = time.time() - t0
     n_edges = int((refined_probs >= best_action.threshold).sum())
@@ -301,50 +433,21 @@ def run_pipeline(
     return result
 
 
-def _evaluate(
-    label: str,
-    probs: np.ndarray,
-    threshold: float,
-    test_edges: set[tuple[str, str]],
-    tf_names: list[str],
-    gene_names: list[str],
-) -> dict:
-    """Evaluate edge predictions against held-out gold-standard."""
-    binary = probs >= threshold
-    predicted = set()
-    for i in range(binary.shape[0]):
-        for j in range(binary.shape[1]):
-            if binary[i, j]:
-                predicted.add((tf_names[i], gene_names[j]))
-
-    tp = len(predicted & test_edges)
-    fp = len(predicted - test_edges)
-    fn = len(test_edges - predicted)
-    precision = tp / max(tp + fp, 1)
-    recall = tp / max(tp + fn, 1)
-    f1 = 2 * precision * recall / max(precision + recall, 1e-8)
-
-    logger.info(
-        "%s evaluation (threshold=%.3f): P=%.4f R=%.4f F1=%.4f "
-        "(TP=%d FP=%d FN=%d, %d predicted)",
-        label, threshold, precision, recall, f1, tp, fp, fn, len(predicted),
-    )
-    return {"precision": precision, "recall": recall, "f1": f1,
-            "tp": tp, "fp": fp, "fn": fn}
-
-
-def _save_results(result: EdgePrediction, best_action, output_dir: Path) -> None:
+def _save_results(
+    result: EdgePrediction,
+    best_action,
+    eval_results: dict,
+    output_dir: Path,
+) -> None:
     """Save pipeline results to disk."""
-    # Save edge probabilities as numpy array
     np.save(output_dir / "edge_probabilities.npy", result.probabilities)
 
-    # Save edge list
     edges = result.to_edge_list(threshold=best_action.threshold)
     df = pd.DataFrame(edges, columns=["tf", "target", "probability"])
     df.to_csv(output_dir / "refined_network.csv", index=False)
     logger.info("Saved %d edges to %s", len(edges), output_dir / "refined_network.csv")
 
-    # Save best action parameters
+    # Save parameters
     params = {
         "threshold": best_action.threshold,
         "rf_weight": best_action.rf_weight,
@@ -354,7 +457,13 @@ def _save_results(result: EdgePrediction, best_action, output_dir: Path) -> None
         "require_motif": best_action.require_motif,
     }
     pd.Series(params).to_csv(output_dir / "best_params.csv")
-    logger.info("Saved parameters to %s", output_dir / "best_params.csv")
+
+    # Save evaluation metrics
+    eval_rows = []
+    for source, metrics in eval_results.items():
+        eval_rows.append({"source": source, **metrics})
+    pd.DataFrame(eval_rows).to_csv(output_dir / "evaluation.csv", index=False)
+    logger.info("Saved evaluation to %s", output_dir / "evaluation.csv")
 
 
 def main():
@@ -368,8 +477,6 @@ def main():
     parser.add_argument("--synthetic", action="store_true", help="Use synthetic data for testing")
     parser.add_argument("--epochs-predictor", type=int, default=100)
     parser.add_argument("--epochs-rl", type=int, default=300)
-    parser.add_argument("--test-fraction", type=float, default=0.2)
-    parser.add_argument("--min-sources", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -389,8 +496,6 @@ def main():
         synthetic=args.synthetic,
         epochs_predictor=args.epochs_predictor,
         epochs_rl=args.epochs_rl,
-        test_fraction=args.test_fraction,
-        min_sources=args.min_sources,
         seed=args.seed,
     )
 

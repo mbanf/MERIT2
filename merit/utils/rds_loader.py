@@ -43,6 +43,12 @@ class V1Intermediates:
 
 def load_rds_matrix(filepath: str | Path) -> np.ndarray:
     """Load a single .rds file containing a numeric matrix."""
+    df = load_rds_dataframe(filepath)
+    return df.values
+
+
+def load_rds_dataframe(filepath: str | Path):
+    """Load a single .rds file, returning the DataFrame with row/column names."""
     try:
         import pyreadr
     except ImportError:
@@ -51,9 +57,7 @@ def load_rds_matrix(filepath: str | Path) -> np.ndarray:
         )
 
     result = pyreadr.read_r(str(filepath))
-    # pyreadr returns a dict of DataFrames; RDS files have one object
-    df = list(result.values())[0]
-    return df.values
+    return list(result.values())[0]
 
 
 def load_v1_intermediates(
@@ -78,17 +82,37 @@ def load_v1_intermediates(
 
     logger.info("Loading v1.0 intermediates from %s", tmp_dir)
 
-    rf = load_rds_matrix(tmp_dir / "m.grn.RF.rds")
-    lr = load_rds_matrix(tmp_dir / "m.grn.LR.rds")
-    clr = load_rds_matrix(tmp_dir / "m.grn.CLR.rds")
+    # Load score matrices with row/column names
+    rf_df = load_rds_dataframe(tmp_dir / "m.grn.RF.rds")
+    lr_df = load_rds_dataframe(tmp_dir / "m.grn.LR.rds")
+    clr_df = load_rds_dataframe(tmp_dir / "m.grn.CLR.rds")
+
+    tf_names = list(rf_df.index)
+    gene_names = list(rf_df.columns)
+
+    rf = rf_df.values
+    lr = lr_df.values
+    clr = clr_df.values
 
     logger.info("  RF: %s, LR: %s, CLR: %s", rf.shape, lr.shape, clr.shape)
+    logger.info("  TFs: %d, Genes: %d", len(tf_names), len(gene_names))
 
-    # Motif matrix
+    # Motif matrix — may have different dimensions, needs alignment
     motif_path = tmp_dir / "m.grn.motifs.rds"
     if motif_path.exists():
-        motifs = load_rds_matrix(motif_path)
-        logger.info("  Motifs: %s", motifs.shape)
+        motif_df = load_rds_dataframe(motif_path)
+        logger.info("  Motifs raw: %s (%d TFs, %d genes)",
+                     motif_df.shape, len(motif_df.index), len(motif_df.columns))
+
+        # Align motif matrix to RF dimensions using pandas reindex (fast)
+        import pandas as pd
+        motif_aligned = motif_df.reindex(index=tf_names, columns=gene_names, fill_value=0.0)
+        motifs = motif_aligned.values
+
+        n_matched_tfs = sum(1 for tf in tf_names if tf in motif_df.index)
+        n_matched_genes = sum(1 for g in gene_names if g in motif_df.columns)
+        logger.info("  Motifs aligned: %d/%d TFs, %d/%d genes matched",
+                     n_matched_tfs, len(tf_names), n_matched_genes, len(gene_names))
     else:
         logger.warning("  Motif matrix not found at %s", motif_path)
         motifs = np.ones_like(rf)
@@ -122,6 +146,8 @@ def load_v1_intermediates(
         rf_bg=rf_bg,
         lr_bg=lr_bg,
         clr_bg=clr_bg,
+        tf_names=tf_names,
+        gene_names=gene_names,
     )
 
 
