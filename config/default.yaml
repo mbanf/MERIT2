@@ -1,0 +1,57 @@
+# MERIT v2.0 configuration
+
+data:
+  genes_file: data/gene_expression/genes.txt
+  experiment_ids_file: data/gene_expression/ids_differentialExpressionSamples.txt
+  fold_change_file: data/gene_expression/m.foldChange_differentialExpression.txt
+  pvalue_file: data/gene_expression/m.pvalue_differentialExpression.txt
+  experiment_annotation_file: data/gene_expression/experiment_annotation.txt
+  tf_annotation_file: data/motifs/df.transcriptionFactorAnnotation.txt
+
+grn:
+  n_trees: 1000
+  n_bootstrap: 100
+  n_steps_lars: 5
+  n_mc_shuffles: 1
+  th_lead: 0.95
+  th_support: 0.95
+  n_grn_support: 1
+  seed: 1234
+
+tfbs:
+  tf_motif_file: data/motifs/TF_to_Motif_IDs.txt
+  pwm_file: data/motifs/Transcription_factor_weight_matrix_Arabidopsis_thaliana.txt
+  promoter_file: data/motifs/TAIR10_upstream_1000_20101104.txt
+  gene_seq_file: data/motifs/TAIR10_seq_20110103_representative_gene_model_updated.txt
+  th_pre_tss: 1000
+  th_post_tss: 200
+  p_cutoff: 0.05
+
+context:
+  th_diffexp: 0.05
+  th_pval_treatment: 0.05
+  th_pval_tissue: 0.05
+  th_min_samples: 1
+
+enrichment:
+  th_pval: 0.05
+  th_min_tf_targets: 2
+
+# Deep learning options (optional)
+gnn:
+  hidden_dim: 128
+  n_layers: 3
+  learning_rate: 0.001
+  epochs: 100
+
+cnn:
+  n_filters: 64
+  kernel_sizes: [7, 11, 15]
+  learning_rate: 0.001
+  epochs: 50
+
+agent:
+  hidden_dim: 256
+  learning_rate: 0.0003
+  gamma: 0.99
+  episodes: 1000

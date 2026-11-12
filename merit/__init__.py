@@ -1,3 +1,3 @@
-"""MERIT — MastEr Regulator Inference Tool (Python port of Release 1.0)."""
+"""MERIT v2.0 — MastEr Regulator Inference Tool."""
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"

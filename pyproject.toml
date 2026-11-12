@@ -4,8 +4,8 @@ build-backend = "setuptools.backends._legacy:_Backend"
 
 [project]
 name = "merit"
-version = "1.0.0"
-description = "MastEr Regulator Inference Tool - Python port of Release 1.0"
+version = "2.0.0"
+description = "MastEr Regulator Inference Tool - GRN inference with ensemble + deep learning methods"
 authors = [{name = "Michael Banf"}]
 license = {text = "MIT"}
 requires-python = ">=3.10"
@@ -21,11 +21,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+deep = [
+    "torch>=2.0",
+    "torch-geometric>=2.4",
+]
+agents = [
+    "torch>=2.0",
+    "gymnasium>=0.29",
+]
 dev = [
     "pytest>=7.0",
     "pytest-cov",
     "ruff",
 ]
+
+[project.scripts]
+merit = "merit.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["merit*"]
