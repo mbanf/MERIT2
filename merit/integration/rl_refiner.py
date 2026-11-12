@@ -229,7 +229,7 @@ def refine_network_rl(
         raw_np = raw_np + noise
 
         # Interpret action
-        threshold = 1.0 / (1.0 + np.exp(-raw_np[0]))  # sigmoid -> (0, 1)
+        threshold = 1.0 / (1.0 + np.exp(-np.clip(raw_np[0], -10, 10)))  # sigmoid -> (0, 1)
         rf_w = np.exp(np.clip(raw_np[1], -2, 2))       # (0.13, 7.4)
         lr_w = np.exp(np.clip(raw_np[2], -2, 2))
         clr_w = np.exp(np.clip(raw_np[3], -2, 2))
